@@ -28,14 +28,20 @@
 #include "V3FsmDetect.h"
 
 #include "V3Ast.h"
+#include "V3Const.h"
 #include "V3Control.h"
 #include "V3Graph.h"
 #include "V3SharedTmps.h"
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <deque>
+#include <fstream>
 #include <map>
 #include <memory>
+#include <set>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -2749,14 +2755,57 @@ public:
     }
 };
 
+#include "V3FsmSymbolic.inc"
+
 }  // namespace
 
 void V3FsmDetect::detect(AstNetlist* rootp) {
     UINFO(2, __FUNCTION__ << ":");
+    // PROTOTYPE: VERILATOR_FSM_SYMBOLIC=1 uses the symbolic extractor; =compare runs both,
+    // logs each FSM to $VERILATOR_FSM_SYMBOLIC_LOG (or stderr), and lowers the old one
+    const char* const modep = std::getenv("VERILATOR_FSM_SYMBOLIC");
+    const string mode = modep ? modep : "";
     FsmState state;
-    // Phase 1: recover each supported FSM into a complete graph while the
-    // original clocked/case structure is still easy to recognize.
-    FsmDetectVisitor detect{state, rootp};
+    if (mode == "1") {
+        FsmSymbolicExtractor symbolic{state, rootp};
+        // Registers committed through fsm_register_wrapper cells: not in the prototype yet,
+        // so take them from the existing extractor
+        FsmState oldState;
+        { FsmDetectVisitor detect{oldState, rootp}; }
+        for (const DetectedFsm& fsm : oldState.fsms()) {
+            if (fsm.graphp->stateAlwaysp()) continue;
+            DetectedFsm& entry = state.fsmFor(fsm.graphp->stateVarScopep());
+            if (!entry.graphp) entry.graphp.reset(const_cast<DetectedFsm&>(fsm).graphp.release());
+        }
+    } else {
+        // Phase 1: recover each supported FSM into a complete graph while the
+        // original clocked/case structure is still easy to recognize.
+        FsmDetectVisitor detect{state, rootp};
+    }
+    if (mode == "compare") {
+        FsmState newState;
+        { FsmSymbolicExtractor symbolic{newState, rootp}; }
+        const char* const logp = std::getenv("VERILATOR_FSM_SYMBOLIC_LOG");
+        std::ofstream logFile;
+        if (logp) logFile.open(logp, std::ios::app);
+        std::ostream& os = logp ? static_cast<std::ostream&>(logFile) : std::cerr;
+        std::map<string, std::pair<string, string>> byName;
+        for (const DetectedFsm& fsm : state.fsms()) {
+            byName[fsm.graphp->stateVarName()].first = fsmSummary(*fsm.graphp);
+        }
+        for (const DetectedFsm& fsm : newState.fsms()) {
+            byName[fsm.graphp->stateVarName()].second = fsmSummary(*fsm.graphp);
+        }
+        for (const auto& it : byName) {
+            const string& oldSum = it.second.first;
+            const string& newSum = it.second.second;
+            os << (oldSum == newSum ? "SAME " : "DIFF ") << it.first << "\n";
+            if (oldSum != newSum) {
+                os << "  old: " << (oldSum.empty() ? "-" : oldSum) << "\n";
+                os << "  new: " << (newSum.empty() ? "-" : newSum) << "\n";
+            }
+        }
+    }
     if (dumpGraphLevel() >= 6) {
         size_t index = 0;
         for (const DetectedFsm& fsm : state.fsms()) {
