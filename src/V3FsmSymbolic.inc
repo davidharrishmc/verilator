@@ -554,7 +554,7 @@ class FsmSymbolicExtractor final {
                      const FsmSymVal* nextp) {
         ++m_regsSeen;
         const int width = stateVscp->width();
-        if (width >= 64) return;
+        if (width > 256) return;  // Wide one-hot FSMs are real; wider is a datapath
         std::map<const FsmSymVal*, const FsmSymVal*> memo;
         const FsmSymVal* treep = resolve(nextp, stateVscp, memo, 0);
         if (treep->kind != FsmSymVal::Kind::MUX) return;
