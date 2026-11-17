@@ -86,12 +86,25 @@ class FsmSymbolicExtractor final {
         val.label = label;
         return &val;
     }
+    // Variables the block being walked writes with '<=': a read in the block sees their old value
+    std::set<const AstVarScope*> m_dlyVscps;
+    void collectDlyWrites(AstNode* stmtsp) {
+        m_dlyVscps.clear();
+        for (AstNode* stmtp = stmtsp; stmtp; stmtp = stmtp->nextp()) {
+            stmtp->foreach([&](const AstAssignDly* assp) {
+                assp->lhsp()->foreach([&](const AstVarRef* refp) {
+                    if (refp->access().isWriteOrRW()) m_dlyVscps.insert(refp->varScopep());
+                });
+            });
+        }
+    }
     const FsmSymCond* makeCond(AstNodeExpr* exprp, const Env& env) {
         m_conds.emplace_back();
         FsmSymCond& cond = m_conds.back();
         cond.exprp = exprp;
         if (exprp) {
             exprp->foreach([&](const AstVarRef* refp) {
+                if (m_dlyVscps.count(refp->varScopep())) return;
                 const auto it = env.find(refp->varScopep());
                 if (it != env.end()) cond.bindings.emplace_back(it->first, it->second);
             });
@@ -145,7 +158,8 @@ class FsmSymbolicExtractor final {
         }
         if (AstVarRef* const refp = VN_CAST(exprp, VarRef)) {
             if (!refp->varp()->isParam()) {
-                const auto it = env.find(refp->varScopep());
+                const auto it = m_dlyVscps.count(refp->varScopep()) ? env.end()
+                                                                    : env.find(refp->varScopep());
                 return it != env.end() ? it->second : ref(refp->varScopep());
             }
         }
@@ -295,13 +309,19 @@ class FsmSymbolicExtractor final {
 
     // Conditions: substitute the state, bound and combinationally driven variables, and
     // continuous aliases, then fold
+    // A condition, and the undecided conditions taken on the path to it
+    using SeenKey = std::pair<const FsmSymCond*, std::vector<std::pair<const FsmSymCond*, bool>>>;
     struct EvalCtx final {
         AstVarScope* stateVscp;
         V3Number s;
         int width;
         std::map<const FsmSymCond*, Tri> condMemo;
-        std::map<const FsmSymCond*, std::set<Tri>>* seenp;  // Results per condition, all states
+        // Results per condition and path, over all states
+        std::map<SeenKey, std::set<Tri>>* seenp;
         std::map<const FsmSymVal*, const FsmSymVal*> resolveMemo;
+        std::map<const FsmSymCond*, bool> path;  // Undecided conditions taken on this path
+        const FsmSymCond* splitp = nullptr;  // An undecided condition to split the path on
+        int pathUses = 0;  // Lookups of 'path': a result that used one isn't memoized
     };
     // The single value of 'valp' in this state, if it has one
     bool singleValue(const FsmSymVal* valp, EvalCtx& ctx, V3Number& num, int depth) {
@@ -324,14 +344,14 @@ class FsmSymbolicExtractor final {
             AstVarScope* const vscp = refp->varScopep();
             V3Number num{refp, refp->width()};
             bool known = false;
-            if (vscp == ctx.stateVscp) {
+            const FsmSymVal* valp = nullptr;
+            for (const auto& binding : cond.bindings) {
+                if (binding.first == vscp) valp = binding.second;
+            }
+            if (!valp && vscp == ctx.stateVscp) {
                 num.opAssign(ctx.s);
                 known = true;
             } else {
-                const FsmSymVal* valp = nullptr;
-                for (const auto& binding : cond.bindings) {
-                    if (binding.first == vscp) valp = binding.second;
-                }
                 if (!valp) {
                     const auto it = m_combVals.find(vscp);
                     if (it != m_combVals.end()) valp = it->second;
@@ -364,11 +384,86 @@ class FsmSymbolicExtractor final {
         }
         return exprp;
     }
-    Tri evalCond(const FsmSymCond* condp, EvalCtx& ctx, int depth) {
-        if (!condp->exprp) return Tri::UNKNOWN;
-        const auto it = ctx.condMemo.find(condp);
-        if (it != ctx.condMemo.end()) return it->second;
-        AstNodeExpr* const clonep = substitute(condp->exprp->cloneTree(false), *condp, ctx, depth);
+    // Bits known after substitution: constants, including inside concatenations and zero
+    // extensions (-1 unknown, 0, 1, 2 for X/Z)
+    static void knownBits(const AstNodeExpr* exprp, std::vector<int>& bits, int lsb) {
+        if (const AstConst* const constp = VN_CAST(exprp, Const)) {
+            for (int i = 0; i < constp->width(); ++i) {
+                bits[lsb + i] = constp->num().bitIs1(i) ? 1 : constp->num().bitIs0(i) ? 0 : 2;
+            }
+        } else if (const AstConcat* const catp = VN_CAST(exprp, Concat)) {
+            knownBits(catp->rhsp(), bits, lsb);
+            knownBits(catp->lhsp(), bits, lsb + catp->rhsp()->width());
+        } else if (const AstExtend* const extp = VN_CAST(exprp, Extend)) {
+            for (int i = extp->lhsp()->width(); i < extp->width(); ++i) bits[lsb + i] = 0;
+            knownBits(extp->lhsp(), bits, lsb);
+        }
+    }
+    // An equality of partly known values, e.g. {state, in} once the state is substituted, that
+    // V3Const leaves alone: a known bit that differs decides it
+    static AstNodeExpr* foldKnownBits(AstNodeExpr* condp) {
+        std::vector<AstNodeBiop*> cmps;
+        condp->foreach([&](AstNodeBiop* biopp) {
+            if (VN_IS(biopp, Eq) || VN_IS(biopp, EqWild) || VN_IS(biopp, EqCase)
+                || VN_IS(biopp, Neq) || VN_IS(biopp, NeqWild) || VN_IS(biopp, NeqCase)) {
+                cmps.push_back(biopp);
+            }
+        });
+        // Innermost first, so replacing one never frees another still to visit
+        for (auto it = cmps.rbegin(); it != cmps.rend(); ++it) {
+            AstNodeBiop* const cmpp = *it;
+            const int width = cmpp->lhsp()->width();
+            if (cmpp->rhsp()->width() != width) continue;
+            std::vector<int> lbits(width, -1);
+            std::vector<int> rbits(width, -1);
+            knownBits(cmpp->lhsp(), lbits, 0);
+            knownBits(cmpp->rhsp(), rbits, 0);
+            const bool wild = VN_IS(cmpp, EqWild) || VN_IS(cmpp, NeqWild);
+            bool differ = false;
+            for (int i = 0; i < width; ++i) {
+                if (wild && rbits[i] == 2) continue;
+                if (lbits[i] >= 0 && lbits[i] < 2 && rbits[i] >= 0 && rbits[i] < 2
+                    && lbits[i] != rbits[i]) {
+                    differ = true;
+                }
+            }
+            if (!differ) continue;
+            const bool neq = VN_IS(cmpp, Neq) || VN_IS(cmpp, NeqWild) || VN_IS(cmpp, NeqCase);
+            AstConst* const newp = neq ? new AstConst{cmpp->fileline(), AstConst::BitTrue{}}
+                                       : new AstConst{cmpp->fileline(), AstConst::BitFalse{}};
+            if (cmpp == condp) {
+                VL_DO_DANGLING(cmpp->deleteTree(), cmpp);
+                return newp;
+            }
+            cmpp->replaceWith(newp);
+            VL_DO_DANGLING(cmpp->deleteTree(), cmpp);
+        }
+        return condp;
+    }
+    // The first undecided condition that chooses among several values of 'valp' on this path
+    const FsmSymCond* undecidedCond(const FsmSymVal* valp, EvalCtx& ctx, int depth) {
+        V3Number one{static_cast<AstNode*>(nullptr), 1, 0};
+        if (depth > 6 || singleValue(valp, ctx, one, depth)) return nullptr;
+        valp = resolve(valp, ctx.stateVscp, ctx.resolveMemo, 0);
+        while (valp->kind == FsmSymVal::Kind::MUX) {
+            const FsmSymCond* const savedp = ctx.splitp;
+            ctx.splitp = nullptr;
+            const Tri result = evalCond(valp->condp, ctx, depth + 1);
+            const FsmSymCond* const innerp = ctx.splitp;
+            ctx.splitp = savedp;
+            if (result == Tri::TRUE) {
+                valp = valp->thenp;
+            } else if (result == Tri::FALSE) {
+                valp = valp->elsep;
+            } else {
+                return innerp ? innerp : valp->condp;
+            }
+        }
+        return nullptr;
+    }
+    Tri evalOnce(const FsmSymCond* condp, EvalCtx& ctx, int depth) {
+        AstNodeExpr* const clonep
+            = foldKnownBits(substitute(condp->exprp->cloneTree(false), *condp, ctx, depth));
         AstNode* const foldedp = V3Const::constifyEdit(clonep);
         Tri result = Tri::UNKNOWN;
         if (const AstConst* const constp = VN_CAST(foldedp, Const)) {
@@ -377,8 +472,31 @@ class FsmSymbolicExtractor final {
             }
         }
         VL_DO_DANGLING(foldedp->deleteTree(), foldedp);
-        ctx.condMemo[condp] = result;
-        if (ctx.seenp) (*ctx.seenp)[condp].insert(result);
+        return result;
+    }
+    Tri evalCond(const FsmSymCond* condp, EvalCtx& ctx, int depth) {
+        if (!condp->exprp) return Tri::UNKNOWN;
+        const auto pit = ctx.path.find(condp);
+        if (pit != ctx.path.end()) {
+            ++ctx.pathUses;
+            return pit->second ? Tri::TRUE : Tri::FALSE;
+        }
+        const auto it = ctx.condMemo.find(condp);
+        if (it != ctx.condMemo.end()) return it->second;
+        // A variable the block gave one of several values earlier in this cycle, e.g. the
+        // state after 'if (start) state = S1;': split the path on what chooses the value
+        for (const auto& binding : condp->bindings) {
+            if (const FsmSymCond* const undecidedp = undecidedCond(binding.second, ctx, depth)) {
+                ctx.splitp = undecidedp;
+                return Tri::UNKNOWN;
+            }
+        }
+        const int uses = ctx.pathUses;
+        const Tri result = evalOnce(condp, ctx, depth);
+        if (ctx.pathUses == uses) ctx.condMemo[condp] = result;
+        if (ctx.seenp) {
+            (*ctx.seenp)[SeenKey{condp, {ctx.path.begin(), ctx.path.end()}}].insert(result);
+        }
         return result;
     }
     void evaluate(const FsmSymVal* valp, EvalCtx& ctx, bool cond, std::vector<Leaf>& leaves,
@@ -388,16 +506,34 @@ class FsmSymbolicExtractor final {
             leaves.push_back(Leaf{Leaf::Kind::CONST, valp->num, valp->flp, cond});
             return;
         case FsmSymVal::Kind::REF:
-            leaves.push_back(Leaf{Leaf::Kind::HOLD, ctx.s, nullptr, cond});
+            // Another register's old value is unknown here
+            leaves.push_back(
+                Leaf{valp->refVscp == ctx.stateVscp ? Leaf::Kind::HOLD : Leaf::Kind::OPAQUE, ctx.s,
+                     nullptr, cond});
             return;
         case FsmSymVal::Kind::OPAQUE:
             leaves.push_back(Leaf{Leaf::Kind::OPAQUE, ctx.s, nullptr, cond});
             return;
         case FsmSymVal::Kind::MUX: {
             const Tri result = evalCond(valp->condp, ctx, depth);
+            if (result == Tri::UNKNOWN && ctx.splitp) {
+                const FsmSymCond* const splitp = ctx.splitp;
+                ctx.splitp = nullptr;
+                for (const bool value : {true, false}) {
+                    ctx.path[splitp] = value;
+                    evaluate(valp, ctx, true, leaves, depth);
+                    ctx.path.erase(splitp);
+                }
+                return;
+            }
             const bool unknown = result == Tri::UNKNOWN;
-            if (result != Tri::FALSE) evaluate(valp->thenp, ctx, cond || unknown, leaves, depth);
-            if (result != Tri::TRUE) evaluate(valp->elsep, ctx, cond || unknown, leaves, depth);
+            for (const bool value : {true, false}) {
+                if (result == (value ? Tri::FALSE : Tri::TRUE)) continue;
+                // An undecided condition keeps its value for the rest of the path
+                if (unknown) ctx.path[valp->condp] = value;
+                evaluate(value ? valp->thenp : valp->elsep, ctx, cond || unknown, leaves, depth);
+                if (unknown) ctx.path.erase(valp->condp);
+            }
             return;
         }
         }
@@ -474,6 +610,24 @@ class FsmSymbolicExtractor final {
                     = ait == m_aliases.end() ? nullptr : VN_CAST(ait->second, VarRef);
                 return aliasp && aliasp->varScopep() == stateVscp;
             };
+            // Bit offset of the state in 'nodep': the state itself, zero-extended, or a field of
+            // a concatenation; -1 if it is none of these
+            std::function<int(const AstNode*, const FsmSymCond*)> stateLsb;
+            stateLsb = [&](const AstNode* nodep, const FsmSymCond* condp) -> int {
+                if (const AstVarRef* const refp = VN_CAST(nodep, VarRef)) {
+                    return isStateRef(refp, condp) ? 0 : -1;
+                }
+                if (const AstExtend* const extp = VN_CAST(nodep, Extend)) {
+                    return stateLsb(extp->lhsp(), condp);
+                }
+                if (const AstConcat* const catp = VN_CAST(nodep, Concat)) {
+                    const int low = stateLsb(catp->rhsp(), condp);
+                    if (low >= 0) return low;
+                    const int high = stateLsb(catp->lhsp(), condp);
+                    return high >= 0 ? high + catp->rhsp()->width() : -1;
+                }
+                return -1;
+            };
             std::function<void(AstNodeExpr*, const FsmSymCond*, int)> compares;
             compares = [&](AstNodeExpr* exprp, const FsmSymCond* condp, int depth) {
                 exprp->foreach([&](const AstNodeBiop* biopp) {
@@ -486,11 +640,14 @@ class FsmSymbolicExtractor final {
                         const AstConst* const constp = VN_CAST(sidep, Const);
                         const AstNode* const otherp
                             = sidep == biopp->lhsp() ? biopp->rhsp() : biopp->lhsp();
-                        if (constp && !constp->num().isAnyXZ()
-                            && otherp->exists(
-                                [&](const AstVarRef* refp) { return isStateRef(refp, condp); })) {
-                            named.emplace_back(constp->origParamName(), constp->num());
-                        }
+                        const int lsb = constp ? stateLsb(otherp, condp) : -1;
+                        if (lsb < 0 || constp->width() < lsb + width) continue;
+                        // The state's field, e.g. S of {state, in} ==? {S, 2'b?1}
+                        V3Number field{static_cast<AstNode*>(nullptr), width, 0};
+                        field.opSel(constp->num(), lsb + width - 1, lsb);
+                        if (field.isAnyXZ()) continue;
+                        named.emplace_back(
+                            VN_IS(otherp, Concat) ? string{} : constp->origParamName(), field);
                     }
                 });
                 // Compares inside continuously assigned wires the condition reads
@@ -532,7 +689,7 @@ class FsmSymbolicExtractor final {
         }
         if (states.size() < 2) return;
         // Evaluate the DAG with the state equal to each state value
-        std::map<const FsmSymCond*, std::set<Tri>> seenResults;
+        std::map<SeenKey, std::set<Tri>> seenResults;
         std::vector<std::vector<Leaf>> leavesByState(states.size());
         for (size_t from = 0; from < states.size(); ++from) {
             EvalCtx ctx{stateVscp, states[from].second, width, {}, &seenResults, {}};
@@ -547,8 +704,13 @@ class FsmSymbolicExtractor final {
         const FsmSymVal* resetp = nullptr;
         const FsmSymVal* normalp = treep;
         {
-            const auto it = seenResults.find(treep->condp);
-            const bool stateFree = it != seenResults.end() && it->second.size() == 1;
+            // Never split on a path, and the same result in every state
+            bool stateFree = false;
+            for (const auto& it : seenResults) {
+                if (it.first.first != treep->condp) continue;
+                stateFree = it.first.second.empty() && it.second.size() == 1;
+                if (!stateFree) break;
+            }
             const auto stateFreeVal = [](const FsmSymVal* valp) {
                 return valp->kind == FsmSymVal::Kind::CONST
                        || valp->kind == FsmSymVal::Kind::OPAQUE;
@@ -675,14 +837,18 @@ class FsmSymbolicExtractor final {
                     clocked.push_back(alwaysp);
                 } else {
                     Env env;
+                    collectDlyWrites(alwaysp->stmtsp());
                     walk(alwaysp->stmtsp(), env);
+                    m_dlyVscps.clear();
                     for (const auto& it : env) m_combVals[it.first] = it.second;
                 }
             }
         }
         std::vector<Env> envs(clocked.size());
         for (size_t i = 0; i < clocked.size(); ++i) {
+            collectDlyWrites(clocked[i]->stmtsp());
             walk(clocked[i]->stmtsp(), envs[i]);
+            m_dlyVscps.clear();
             for (const auto& it : envs[i]) ++m_clockedWriters[it.first];
         }
         for (size_t i = 0; i < clocked.size(); ++i) {

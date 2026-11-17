@@ -2800,10 +2800,8 @@ void V3FsmDetect::detect(AstNetlist* rootp) {
             const string& oldSum = it.second.first;
             const string& newSum = it.second.second;
             os << (oldSum == newSum ? "SAME " : "DIFF ") << it.first << "\n";
-            if (oldSum != newSum) {
-                os << "  old: " << (oldSum.empty() ? "-" : oldSum) << "\n";
-                os << "  new: " << (newSum.empty() ? "-" : newSum) << "\n";
-            }
+            os << "  old: " << (oldSum.empty() ? "-" : oldSum) << "\n";
+            os << "  new: " << (newSum.empty() ? "-" : newSum) << "\n";
         }
     }
     if (dumpGraphLevel() >= 6) {
