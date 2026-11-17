@@ -671,6 +671,27 @@ class FsmSymbolicExtractor final {
                     stack.push_back(valp->elsep);
                 }
             }
+            // Labels of a case on the state, including items that leave it unchanged (their
+            // branch merges with the hold, so it isn't in the DAG)
+            const FsmSymCond noBindings;
+            scopep->foreach([&](const AstCase* casep) {
+                const int lsb = stateLsb(casep->exprp(), &noBindings);
+                if (lsb < 0) return;
+                for (const AstCaseItem* itemp = casep->itemsp(); itemp;
+                     itemp = VN_AS(itemp->nextp(), CaseItem)) {
+                    for (const AstNodeExpr* labelp = itemp->condsp(); labelp;
+                         labelp = VN_AS(labelp->nextp(), NodeExpr)) {
+                        const AstConst* const constp = VN_CAST(labelp, Const);
+                        if (!constp || constp->width() < lsb + width) continue;
+                        V3Number field{static_cast<AstNode*>(nullptr), width, 0};
+                        field.opSel(constp->num(), lsb + width - 1, lsb);
+                        if (field.isAnyXZ()) continue;
+                        named.emplace_back(VN_IS(casep->exprp(), Concat) ? string{}
+                                                                         : constp->origParamName(),
+                                           field);
+                    }
+                }
+            });
         }
         if (enump) {
             std::set<string> namedKeys;
